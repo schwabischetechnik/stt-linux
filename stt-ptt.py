@@ -69,71 +69,102 @@ def check_x11_session() -> None:
         sys.exit(2)
 
 
+def _fatal(msg: str) -> None:
+    LOG.error("%s", msg)
+    notify("STT-PTT", msg, "critical")
+    sys.exit(1)
+
+
+def _build_profile(backend: str, section, shared: dict, hotkey: str, path: Path) -> dict:
+    """Erzeugt ein Profil-Dict fuer ein Backend aus dessen Sektion + shared-Defaults."""
+    p = dict(shared)
+    p["backend"] = backend
+    p["hotkey"] = hotkey
+    # Per-Profil-Overrides der Shared-Settings sind erlaubt.
+    if "language_code" in section:
+        p["language_code"] = (section.get("language_code", "").strip() or None)
+    if "type_delay_ms" in section:
+        p["type_delay_ms"] = int(section.get("type_delay_ms"))
+
+    if backend == "elevenlabs":
+        api_key = section.get("api_key", "").strip()
+        if not api_key or api_key.startswith("YOUR_"):
+            _fatal(f"api_key fehlt in [elevenlabs] ({path})")
+        p["api_key"] = api_key
+        p["model_id"] = section.get("model_id", "scribe_v2")
+    elif backend == "whisper_remote":
+        endpoint = section.get("endpoint", "").strip()
+        if not endpoint:
+            _fatal(f"endpoint fehlt in [whisper_remote] ({path})")
+        p["endpoint"] = endpoint.rstrip("/")
+        p["model"] = section.get("model", "whisper-1")
+        p["api_key"] = section.get("api_key", "").strip()
+        p["timeout"] = float(section.get("timeout", "60"))
+    elif backend == "whisper_local":
+        p["model"] = section.get("model", "base")
+        p["device"] = section.get("device", "auto")
+        p["compute_type"] = section.get("compute_type", "auto")
+    return p
+
+
 def load_config(path: Path) -> dict:
+    """Liefert {"shared": {...}, "profiles": [profile, ...]}.
+
+    Multi-Hotkey-Modus: jede Backend-Sektion mit eigenem `hotkey =` wird zu
+    einem Profil. Single-Modus (Backwards-Compat): wenn keine Sektion einen
+    Hotkey definiert, wird `[general] backend` + globaler Hotkey verwendet.
+    """
     if not path.exists():
-        LOG.error("Config nicht gefunden: %s", path)
-        notify("STT-PTT", f"Config fehlt: {path}", "critical")
-        sys.exit(1)
+        _fatal(f"Config nicht gefunden: {path}")
     cp = configparser.ConfigParser()
     cp.read(path)
 
     g = cp["general"] if cp.has_section("general") else {}
-    backend = (g.get("backend", "elevenlabs") if g else "elevenlabs").strip().lower()
-    if backend not in VALID_BACKENDS:
-        LOG.error("Ungueltiges backend=%s (erlaubt: %s)", backend, ", ".join(VALID_BACKENDS))
-        notify("STT-PTT", f"Ungueltiges backend: {backend}", "critical")
-        sys.exit(1)
-
-    # Shared settings: prefer [general], fall back to [elevenlabs] for back-compat.
     el = cp["elevenlabs"] if cp.has_section("elevenlabs") else {}
 
-    def shared(key: str, default: str) -> str:
+    def shared_get(key: str, default: str) -> str:
         if g and key in g:
             return g.get(key)
         if el and key in el:
             return el.get(key)
         return default
 
-    cfg = {
-        "backend": backend,
-        "hotkey": shared("hotkey", "pause"),
-        "language_code": (shared("language_code", "").strip() or None),
-        "sample_rate": int(shared("sample_rate", "16000")),
-        "min_seconds": float(shared("min_recording_seconds", "0.3")),
-        "max_seconds": float(shared("max_recording_seconds", "120")),
-        "type_delay_ms": int(shared("type_delay_ms", "8")),
+    shared = {
+        "language_code": (shared_get("language_code", "").strip() or None),
+        "sample_rate": int(shared_get("sample_rate", "16000")),
+        "min_seconds": float(shared_get("min_recording_seconds", "0.3")),
+        "max_seconds": float(shared_get("max_recording_seconds", "120")),
+        "type_delay_ms": int(shared_get("type_delay_ms", "8")),
     }
 
-    if backend == "elevenlabs":
-        api_key = el.get("api_key", "").strip() if el else ""
-        if not api_key or api_key.startswith("YOUR_"):
-            notify("STT-PTT", f"api_key fehlt in {path}", "critical")
-            LOG.error("api_key fehlt in %s", path)
-            sys.exit(1)
-        cfg["api_key"] = api_key
-        cfg["model_id"] = el.get("model_id", "scribe_v2")
-    elif backend == "whisper_remote":
-        if not cp.has_section("whisper_remote"):
-            LOG.error("Section [whisper_remote] fehlt in %s", path)
-            notify("STT-PTT", "[whisper_remote] fehlt", "critical")
-            sys.exit(1)
-        w = cp["whisper_remote"]
-        endpoint = w.get("endpoint", "").strip()
-        if not endpoint:
-            LOG.error("endpoint fehlt in [whisper_remote]")
-            notify("STT-PTT", "endpoint fehlt", "critical")
-            sys.exit(1)
-        cfg["endpoint"] = endpoint.rstrip("/")
-        cfg["model"] = w.get("model", "whisper-1")
-        cfg["api_key"] = w.get("api_key", "").strip()
-        cfg["timeout"] = float(w.get("timeout", "60"))
-    elif backend == "whisper_local":
-        w = cp["whisper_local"] if cp.has_section("whisper_local") else {}
-        cfg["model"] = (w.get("model", "base") if w else "base")
-        cfg["device"] = (w.get("device", "auto") if w else "auto")
-        cfg["compute_type"] = (w.get("compute_type", "auto") if w else "auto")
+    # Sammle Sektionen mit eigenem Hotkey.
+    profiles: list[dict] = []
+    seen_hotkeys: dict[str, str] = {}
+    for backend in VALID_BACKENDS:
+        if not cp.has_section(backend):
+            continue
+        sec = cp[backend]
+        hk = sec.get("hotkey", "").strip()
+        if not hk:
+            continue
+        if hk in seen_hotkeys:
+            _fatal(f"Hotkey '{hk}' doppelt belegt ([{seen_hotkeys[hk]}] und [{backend}])")
+        seen_hotkeys[hk] = backend
+        profiles.append(_build_profile(backend, sec, shared, hk, path))
 
-    return cfg
+    if profiles:
+        return {"shared": shared, "profiles": profiles}
+
+    # Legacy-Modus: [general] backend = ... + globaler Hotkey
+    backend = (g.get("backend", "elevenlabs") if g else "elevenlabs").strip().lower()
+    if backend not in VALID_BACKENDS:
+        _fatal(f"Ungueltiges backend={backend} (erlaubt: {', '.join(VALID_BACKENDS)})")
+    if not cp.has_section(backend) and backend != "whisper_local":
+        _fatal(f"Section [{backend}] fehlt in {path}")
+    sec = cp[backend] if cp.has_section(backend) else cp["DEFAULT"]
+    hk = shared_get("hotkey", "pause")
+    profiles.append(_build_profile(backend, sec, shared, hk, path))
+    return {"shared": shared, "profiles": profiles}
 
 
 class Recorder:
@@ -374,47 +405,64 @@ def parse_hotkey(spec: str):
 
 class App:
     def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.hotkey = parse_hotkey(cfg["hotkey"])
-        self.recorder = Recorder(cfg["sample_rate"], cfg["max_seconds"])
-        self.key_held = False
+        self.profiles = cfg["profiles"]
+        shared = cfg["shared"]
+        self.sample_rate = shared["sample_rate"]
+        # Hotkey-Lookup: pynput-Key -> profile
+        self.bindings: dict = {}
+        for p in self.profiles:
+            key = parse_hotkey(p["hotkey"])
+            self.bindings[key] = p
+        # Eine Aufnahme zur Zeit (nur ein Mikrofon-Stream).
+        self.recorder = Recorder(self.sample_rate, shared["max_seconds"])
+        self.active_profile: dict | None = None
         self.t_start = 0.0
+        self.state_lock = threading.Lock()
         self.worker_lock = threading.Lock()
 
     def on_press(self, key):
-        if key != self.hotkey or self.key_held:
+        profile = self.bindings.get(key)
+        if profile is None:
             return
-        self.key_held = True
-        if self.recorder.start():
+        with self.state_lock:
+            if self.active_profile is not None:
+                return  # andere Aufnahme laeuft
+            if not self.recorder.start():
+                return
+            self.active_profile = profile
             self.t_start = time.monotonic()
-            notify("Aufnahme laeuft", f"Hotkey: {self.cfg['hotkey']}", "low")
+        notify("Aufnahme laeuft",
+               f"[{profile['hotkey']}] -> {profile['backend']}", "low")
 
     def on_release(self, key):
-        if key != self.hotkey or not self.key_held:
-            return
-        self.key_held = False
-        duration = time.monotonic() - self.t_start
+        with self.state_lock:
+            profile = self.active_profile
+            if profile is None or key not in self.bindings:
+                return
+            # Nur die Taste, die die laufende Aufnahme gestartet hat, beendet sie.
+            if self.bindings[key] is not profile:
+                return
+            self.active_profile = None
+            duration = time.monotonic() - self.t_start
         audio = self.recorder.stop()
-        if audio is None or duration < self.cfg["min_seconds"]:
+        if audio is None or duration < profile["min_seconds"]:
             notify("Zu kurz", "Aufnahme verworfen", "low")
             return
-        threading.Thread(target=self._process, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._process, args=(audio, profile), daemon=True).start()
 
-    def _process(self, audio: np.ndarray) -> None:
+    def _process(self, audio: np.ndarray, profile: dict) -> None:
         with self.worker_lock:
-            notify("Transkribiere ...", "", "low")
-            text = transcribe(audio, self.cfg["sample_rate"], self.cfg)
+            notify("Transkribiere ...", profile["backend"], "low")
+            text = transcribe(audio, self.sample_rate, profile)
             if not text:
                 notify("Kein Text erkannt", "", "normal")
                 return
-            type_text(text, self.cfg["type_delay_ms"])
+            type_text(text, profile["type_delay_ms"])
 
     def run(self) -> None:
-        notify("STT-PTT bereit",
-               f"Halte [{self.cfg['hotkey']}] zum Diktieren", "low")
-        model_label = self.cfg.get("model_id") or self.cfg.get("model") or "?"
-        LOG.info("Listener gestartet, Backend=%s, Hotkey=%s, Modell=%s",
-                 self.cfg["backend"], self.cfg["hotkey"], model_label)
+        bindings_desc = ", ".join(f"[{p['hotkey']}]->{p['backend']}" for p in self.profiles)
+        notify("STT-PTT bereit", bindings_desc, "low")
+        LOG.info("Listener gestartet, Bindings: %s", bindings_desc)
         with keyboard.Listener(on_press=self.on_press, on_release=self.on_release) as listener:
             listener.join()
 

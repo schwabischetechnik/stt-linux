@@ -43,8 +43,12 @@ Für das **lokale Whisper-Backend** zusätzlich:
 
 ## Konfiguration
 
-Bearbeite `~/.config/stt-ptt/config.ini`. Wähle in `[general]` ein Backend
-und fülle den entsprechenden Abschnitt aus.
+Bearbeite `~/.config/stt-ptt/config.ini`. Zwei Betriebsarten:
+
+- **Single-Hotkey**: in `[general]` ein Backend wählen und einen globalen
+  Hotkey setzen. Eine Taste → ein Backend.
+- **Multi-Hotkey**: in mehreren Backend-Sektionen je einen eigenen `hotkey`
+  setzen. Jede Taste spricht ein anderes Backend an (siehe ganz unten).
 
 ### ElevenLabs
 
@@ -104,6 +108,35 @@ Beim ersten Start wird das Modell von Hugging Face heruntergeladen
 - `tiny` / `base` — schnell auf CPU, mäßige Qualität
 - `small` — guter Kompromiss für CPU
 - `medium` / `large-v3` — beste Qualität, GPU empfohlen
+
+### Multi-Hotkey (mehrere Backends gleichzeitig)
+
+Beispiel: drei Tasten, drei Backends.
+
+```ini
+[general]
+language_code = de
+
+[elevenlabs]
+hotkey   = right_ctrl
+api_key  = sk_...
+model_id = scribe_v2
+
+[whisper_remote]
+hotkey   = right_alt
+endpoint = http://192.168.1.50:8000/v1
+model    = Systran/faster-whisper-large-v3
+
+[whisper_local]
+hotkey       = pause
+model        = base
+device       = auto
+compute_type = auto
+```
+
+`right_ctrl` halten → ElevenLabs, `right_alt` → Server im LAN, `pause` →
+lokales Whisper. Während eine Aufnahme läuft, ignoriert das Tool die
+anderen Tasten (nur ein Mikrofon-Stream gleichzeitig).
 
 ## Bedienung
 
