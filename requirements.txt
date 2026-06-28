@@ -1,0 +1,7 @@
+numpy
+requests
+sounddevice
+soundfile
+pynput
+# Optional, nur für backend = whisper_local benötigt:
+# faster-whisper
